@@ -197,6 +197,7 @@ class BaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    value_vector_norms: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -243,6 +244,7 @@ class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
+    value_vector_norms: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass
@@ -597,6 +599,7 @@ class SequenceClassifierOutput(ModelOutput):
     logits: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
     attentions: Optional[Tuple[torch.FloatTensor]] = None
+    value_vector_norms: Optional[Tuple[torch.FloatTensor]] = None
 
 
 @dataclass

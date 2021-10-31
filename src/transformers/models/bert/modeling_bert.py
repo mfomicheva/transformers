@@ -163,6 +163,62 @@ def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
     return model
 
 
+class BertNormOutput(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+    def forward(self, hidden_states, attention_probs, value_layer, dense):
+        # hidden_states: (batch, seq_length, all_head_size)
+        # attention_probs: (batch, num_heads, seq_length, seq_length)
+        # value_layer: (batch, num_heads, seq_length, head_size)
+        # dense: nn.Linear(all_head_size, all_head_size)
+
+        with torch.no_grad():
+            # value_layer is converted to (batch, seq_length, num_heads, 1, head_size)
+            value_layer = value_layer.permute(0, 2, 1, 3).contiguous()
+            value_shape = value_layer.size()
+            value_layer = value_layer.view(value_shape[:-1] + (1, value_shape[-1],))
+
+            # dense weight is converted to (num_heads, head_size, all_head_size)
+            dense = dense.weight
+            dense = dense.view(self.all_head_size, self.num_attention_heads, self.attention_head_size)
+            dense = dense.permute(1, 2, 0).contiguous()
+
+            # Make transformed vectors f(x) from Value vectors (value_layer) and weight matrix (dense).
+            transformed_layer = value_layer.matmul(dense)
+            transformed_shape = transformed_layer.size()  # (batch, seq_length, num_heads, 1, all_head_size)
+            transformed_layer = transformed_layer.view(transformed_shape[:-2] + (transformed_shape[-1],))
+            transformed_layer = transformed_layer.permute(0, 2, 1, 3).contiguous()
+            transformed_shape = transformed_layer.size()  # (batch, num_heads, seq_length, all_head_size)
+            transformed_norm = torch.norm(transformed_layer, dim=-1)
+
+            # Make weighted vectors αf(x) from transformed vectors (transformed_layer) and attention weights (attention_probs).
+            weighted_layer = torch.einsum('bhks,bhsd->bhksd', attention_probs,
+                                          transformed_layer)  # (batch, num_heads, seq_length, seq_length, all_head_size)
+            weighted_norm = torch.norm(weighted_layer, dim=-1)
+
+            # Sum each αf(x) over all heads: (batch, seq_length, seq_length, all_head_size)
+            summed_weighted_layer = weighted_layer.sum(dim=1)
+
+            # Calculate L2 norm of summed weighted vectors: (batch, seq_length, seq_length)
+            summed_weighted_norm = torch.norm(summed_weighted_layer, dim=-1)
+
+            del transformed_shape
+
+            # outputs: ||f(x)||, ||αf(x)||, ||Σαf(x)||
+            outputs = (transformed_norm,
+                       weighted_norm,
+                       summed_weighted_norm,
+                       )
+            del transformed_layer, weighted_layer, summed_weighted_layer
+        torch.cuda.empty_cache()
+        return outputs
+
+
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
 
@@ -262,6 +318,7 @@ class BertSelfAttention(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_value_vector_norms=False,
     ):
         mixed_query_layer = self.query(hidden_states)
 
@@ -345,6 +402,9 @@ class BertSelfAttention(nn.Module):
 
         if self.is_decoder:
             outputs = outputs + (past_key_value,)
+
+        if output_value_vector_norms:
+            outputs = outputs + (value_layer,)
         return outputs
 
 
@@ -367,6 +427,7 @@ class BertAttention(nn.Module):
         super().__init__()
         self.self = BertSelfAttention(config)
         self.output = BertSelfOutput(config)
+        self.norm = BertNormOutput(config)
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
@@ -396,6 +457,7 @@ class BertAttention(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_value_vector_norms=False,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -405,9 +467,11 @@ class BertAttention(nn.Module):
             encoder_attention_mask,
             past_key_value,
             output_attentions,
+            output_value_vector_norms,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
-        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+        norms_outputs = self.norm(hidden_states, self_outputs[1], self_outputs[2], self.output.dense)
+        outputs = (attention_output, self_outputs[1],) + norms_outputs  # add attentions and norms if we output them
         return outputs
 
 
@@ -543,11 +607,13 @@ class BertEncoder(nn.Module):
         use_cache=None,
         output_attentions=False,
         output_hidden_states=False,
+        output_value_vector_norms=False,
         return_dict=True,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+        all_norms = () if output_value_vector_norms else None
 
         next_decoder_cache = () if use_cache else None
         for i, layer_module in enumerate(self.layer):
@@ -597,6 +663,8 @@ class BertEncoder(nn.Module):
                 all_self_attentions = all_self_attentions + (layer_outputs[1],)
                 if self.config.add_cross_attention:
                     all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
+            if output_value_vector_norms:
+                all_norms = all_norms + (layer_outputs[2:],)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -610,6 +678,7 @@ class BertEncoder(nn.Module):
                     all_hidden_states,
                     all_self_attentions,
                     all_cross_attentions,
+                    all_norms,
                 ]
                 if v is not None
             )
@@ -619,6 +688,7 @@ class BertEncoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
+            value_vector_norms=all_norms,
         )
 
 
@@ -905,6 +975,7 @@ class BertModel(BertPreTrainedModel):
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
+        output_value_vector_norms=None,
         return_dict=None,
     ):
         r"""
@@ -1003,6 +1074,7 @@ class BertModel(BertPreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_value_vector_norms=output_value_vector_norms,
             return_dict=return_dict,
         )
         sequence_output = encoder_outputs[0]
@@ -1018,6 +1090,7 @@ class BertModel(BertPreTrainedModel):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
+            value_vector_norms=encoder_outputs.value_vector_norms
         )
 
 
@@ -1517,6 +1590,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         labels=None,
         output_attentions=None,
         output_hidden_states=None,
+        output_value_vector_norms=None,
         return_dict=None,
     ):
         r"""
@@ -1536,6 +1610,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_value_vector_norms=output_value_vector_norms,
             return_dict=return_dict,
         )
 
@@ -1575,6 +1650,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            value_vector_norms=outputs.value_vector_norms
         )
 
 
