@@ -530,6 +530,7 @@ class BertLayer(nn.Module):
         encoder_attention_mask=None,
         past_key_value=None,
         output_attentions=False,
+        output_value_vector_norms=False,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -538,6 +539,7 @@ class BertLayer(nn.Module):
             attention_mask,
             head_mask,
             output_attentions=output_attentions,
+            output_value_vector_norms=output_value_vector_norms,
             past_key_value=self_attn_past_key_value,
         )
         attention_output = self_attention_outputs[0]
