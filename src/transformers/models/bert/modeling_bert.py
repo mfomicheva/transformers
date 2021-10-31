@@ -658,6 +658,7 @@ class BertEncoder(nn.Module):
                     encoder_attention_mask,
                     past_key_value,
                     output_attentions,
+                    output_value_vector_norms,
                 )
 
             hidden_states = layer_outputs[0]
