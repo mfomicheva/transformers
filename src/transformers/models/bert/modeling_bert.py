@@ -473,7 +473,10 @@ class BertAttention(nn.Module):
         norms_outputs = ()
         if output_value_vector_norms:
             norms_outputs = self.norm(hidden_states, self_outputs[1], self_outputs[2], self.output.dense)
-        outputs = (attention_output, self_outputs[1],) + norms_outputs  # add attentions and norms if we output them
+        attentions = self_outputs[1] if len(self_outputs) > 1 else ()
+        outputs = (attention_output,)
+        outputs = outputs + (attentions,)
+        outputs = outputs + (norms_outputs,)  # add attentions and norms if we output them
         return outputs
 
 
